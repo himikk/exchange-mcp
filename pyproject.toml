@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exchange-mcp"
+version = "0.1.0"
+description = "MCP server for Microsoft Exchange"
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "exchange",
+    "microsoft-exchange",
+    "ews",
+    "outlook",
+    "email",
+    "calendar",
+    "contacts",
+    "automation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Email",
+    "Topic :: Office/Business :: Groupware",
+]
+dependencies = [
+    "mcp>=1.0",
+    "exchangelib>=5.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "email-validator>=2.0",
+    "requests-ntlm>=1.3",
+    "python-dateutil>=2.9",
+    "uvicorn>=0.30",
+]
+
+[project.urls]
+Homepage = "https://github.com/himikk/exchange-mcp"
+Repository = "https://github.com/himikkexchange-mcp"
+Issues = "https://github.com/himikk/exchange-mcp/issues"
+
+[project.scripts]
+exchange-mcp = "exchange_mcp.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
