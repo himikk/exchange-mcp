@@ -5,7 +5,7 @@ import re
 import tempfile
 import warnings
 from collections.abc import Iterable
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -26,6 +26,7 @@ from exchangelib import (
     Mailbox,
     Message,
     NTLM,
+    Task,
 )
 from exchangelib.ewsdatetime import EWSDateTime
 from exchangelib.errors import (
@@ -64,15 +65,18 @@ from .models import (
     AvailabilityResult,
     CalendarInfo,
     CalendarEvent,
+    CompleteTaskRequest,
     ContactFull,
     ContactSummary,
     CreateEventRequest,
     CreateEventResult,
     CreateContactRequest,
     CreateFolderRequest,
+    CreateTaskRequest,
     DeleteContactRequest,
     DeleteEmailRequest,
     DeleteEventRequest,
+    DeleteTaskRequest,
     DraftEmailRequest,
     EmailFull,
     EmailSummary,
@@ -86,9 +90,11 @@ from .models import (
     GetContactRequest,
     GetEmailRequest,
     GetEventRequest,
+    GetTaskRequest,
     ListEmailsRequest,
     ListEventsRequest,
     ListFoldersRequest,
+    ListTasksRequest,
     MailboxInfo,
     MarkEmailRequest,
     PingResult,
@@ -100,8 +106,11 @@ from .models import (
     SendEmailRequest,
     SendResult,
     Attachment,
+    TaskFull,
+    TaskSummary,
     UpdateContactRequest,
     UpdateEventRequest,
+    UpdateTaskRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -148,6 +157,12 @@ class ExchangeBackend(Protocol):
     def create_contact(self, request: CreateContactRequest) -> ActionResult: ...
     def update_contact(self, request: UpdateContactRequest) -> ActionResult: ...
     def delete_contact(self, request: DeleteContactRequest) -> ActionResult: ...
+    def list_tasks(self, request: ListTasksRequest) -> list[TaskSummary]: ...
+    def get_task(self, request: GetTaskRequest) -> TaskFull: ...
+    def create_task(self, request: CreateTaskRequest) -> ActionResult: ...
+    def update_task(self, request: UpdateTaskRequest) -> ActionResult: ...
+    def complete_task(self, request: CompleteTaskRequest) -> ActionResult: ...
+    def delete_task(self, request: DeleteTaskRequest) -> ActionResult: ...
 
 
 class ExchangeClient:
@@ -247,6 +262,24 @@ class ExchangeClient:
 
     def delete_contact(self, request: DeleteContactRequest) -> ActionResult:
         return self.backend.delete_contact(request)
+
+    def list_tasks(self, request: ListTasksRequest) -> list[TaskSummary]:
+        return self.backend.list_tasks(request)
+
+    def get_task(self, request: GetTaskRequest) -> TaskFull:
+        return self.backend.get_task(request)
+
+    def create_task(self, request: CreateTaskRequest) -> ActionResult:
+        return self.backend.create_task(request)
+
+    def update_task(self, request: UpdateTaskRequest) -> ActionResult:
+        return self.backend.update_task(request)
+
+    def complete_task(self, request: CompleteTaskRequest) -> ActionResult:
+        return self.backend.complete_task(request)
+
+    def delete_task(self, request: DeleteTaskRequest) -> ActionResult:
+        return self.backend.delete_task(request)
 
 
 def build_default_backend(settings: Settings) -> ExchangeBackend:
@@ -1260,6 +1293,182 @@ class EWSExchangeBackend:
         contact = self._fetch_item(request.id, folder=self.account.contacts)
         try:
             contact.move_to_trash()
+            return ActionResult(id=request.id, status="deleted")
+        except Exception as exc:  # noqa: BLE001
+            raise self._map_exception(exc, item_id=request.id) from exc
+
+    # --- Tasks -------------------------------------------------------------
+
+    _TASK_STATUS_MAP = {
+        "NotStarted": "not_started",
+        "InProgress": "in_progress",
+        "Completed": "completed",
+        "WaitingOnOthers": "waiting_on_others",
+        "Deferred": "deferred",
+    }
+    _TASK_STATUS_REVERSE = {v: k for k, v in _TASK_STATUS_MAP.items()}
+
+    def _normalize_task_status(self, value: Any) -> str:
+        normalized = str(value or "NotStarted")
+        return self._TASK_STATUS_MAP.get(normalized, "not_started")
+
+    def _to_task_summary(self, item: Any) -> TaskSummary:
+        return TaskSummary(
+            id=item.id,
+            subject=item.subject or "",
+            status=self._normalize_task_status(getattr(item, "status", None)),
+            percent_complete=int(float(getattr(item, "percent_complete", 0) or 0)),
+            due_date=self._date_from_ews(getattr(item, "due_date", None)),
+            start_date=self._date_from_ews(getattr(item, "start_date", None)),
+            is_complete=bool(getattr(item, "is_complete", False)),
+            has_attachments=bool(getattr(item, "has_attachments", False)),
+            importance=self._normalize_importance(getattr(item, "importance", None)),
+            categories=list(getattr(item, "categories", None) or []),
+            reminder_is_set=bool(getattr(item, "reminder_is_set", False)),
+        )
+
+    def _to_task_full(self, item: Any) -> TaskFull:
+        body_text, body_html = self._extract_message_body(item)
+        return TaskFull(
+            **self._to_task_summary(item).model_dump(by_alias=True),
+            body=body_text or None,
+            body_type="html" if body_html else "text",
+            complete_date=self._date_from_ews(getattr(item, "complete_date", None)),
+            reminder_minutes_before_start=getattr(item, "reminder_minutes_before_start", None),
+            companies=list(getattr(item, "companies", None) or []),
+            contacts=list(getattr(item, "contacts", None) or []),
+            billing_information=getattr(item, "billing_information", None),
+            owner=getattr(item, "owner", None),
+            last_modified_time=getattr(item, "last_modified_time", None),
+        )
+
+    @staticmethod
+    def _date_from_ews(value: Any) -> date | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        return None
+
+    def list_tasks(self, request: ListTasksRequest) -> list[TaskSummary]:
+        qs = self.account.tasks.all().order_by("-due_date")
+        filters: dict[str, Any] = {}
+        if request.status:
+            filters["status"] = self._TASK_STATUS_REVERSE[request.status]
+        if request.category:
+            filters["categories__contains"] = request.category
+        if request.due_before:
+            filters["due_date__lt"] = request.due_before
+        if request.due_after:
+            filters["due_date__gte"] = request.due_after
+        if request.incomplete_only:
+            filters["is_complete"] = False
+        if filters:
+            qs = qs.filter(**filters)
+        try:
+            items = list(qs[request.offset : request.offset + request.limit])
+        except Exception as exc:  # noqa: BLE001
+            raise self._map_exception(exc) from exc
+        return [self._to_task_summary(item) for item in items]
+
+    def get_task(self, request: GetTaskRequest) -> TaskFull:
+        item = self._fetch_item(request.id, folder=self.account.tasks)
+        return self._to_task_full(item)
+
+    def create_task(self, request: CreateTaskRequest) -> ActionResult:
+        body: Any = None
+        if request.body:
+            body = HTMLBody(request.body) if request.body_type == "html" else request.body
+        task = Task(
+            account=self.account,
+            folder=self.account.tasks,
+            subject=request.subject,
+            body=body,
+            start_date=request.start_date,
+            due_date=request.due_date,
+            categories=request.categories or None,
+            importance=request.importance.capitalize(),
+        )
+        if request.reminder_minutes is not None:
+            task.reminder_is_set = True
+            task.reminder_minutes_before_start = request.reminder_minutes
+        try:
+            task.save()
+            return ActionResult(id=task.id or "", status="created")
+        except Exception as exc:  # noqa: BLE001
+            raise self._map_exception(exc) from exc
+
+    def update_task(self, request: UpdateTaskRequest) -> ActionResult:
+        from decimal import Decimal
+
+        item = self._fetch_item(request.id, folder=self.account.tasks)
+        updated_fields: list[str] = []
+        if request.subject is not None:
+            item.subject = request.subject
+            updated_fields.append("subject")
+        if request.body is not None:
+            item.body = HTMLBody(request.body) if request.body_type == "html" else request.body
+            updated_fields.append("body")
+        if request.start_date is not None:
+            item.start_date = request.start_date
+            updated_fields.append("start_date")
+        if request.due_date is not None:
+            item.due_date = request.due_date
+            updated_fields.append("due_date")
+        if request.percent_complete is not None:
+            item.percent_complete = Decimal(request.percent_complete)
+            updated_fields.append("percent_complete")
+            if request.percent_complete == 100:
+                item.status = "Completed"
+                if "status" not in updated_fields:
+                    updated_fields.append("status")
+            elif 0 < request.percent_complete < 100:
+                if str(getattr(item, "status", "")) in ("NotStarted", "Completed"):
+                    item.status = "InProgress"
+                    if "status" not in updated_fields:
+                        updated_fields.append("status")
+        if request.reminder_minutes is not None:
+            item.reminder_is_set = True
+            item.reminder_minutes_before_start = request.reminder_minutes
+            updated_fields.append("reminder_is_set")
+            updated_fields.append("reminder_minutes_before_start")
+        if request.categories is not None:
+            item.categories = request.categories or None
+            updated_fields.append("categories")
+        if request.importance is not None:
+            item.importance = request.importance.capitalize()
+            updated_fields.append("importance")
+        if not updated_fields:
+            return ActionResult(id=request.id, status="updated", updated_fields=[])
+        try:
+            item.save(update_fields=updated_fields)
+            return ActionResult(id=request.id, status="updated", updated_fields=updated_fields)
+        except Exception as exc:  # noqa: BLE001
+            raise self._map_exception(exc, item_id=request.id) from exc
+
+    def complete_task(self, request: CompleteTaskRequest) -> ActionResult:
+        from decimal import Decimal
+
+        item = self._fetch_item(request.id, folder=self.account.tasks)
+        try:
+            item.status = "Completed"
+            item.percent_complete = Decimal(100)
+            # complete_date is server-computed when status becomes Completed;
+            # writing it directly raises "read-only field".
+            item.save(update_fields=["status", "percent_complete"])
+            return ActionResult(id=request.id, status="completed", updated_fields=["status", "percent_complete"])
+        except Exception as exc:  # noqa: BLE001
+            raise self._map_exception(exc, item_id=request.id) from exc
+
+    def delete_task(self, request: DeleteTaskRequest) -> ActionResult:
+        item = self._fetch_item(request.id, folder=self.account.tasks)
+        try:
+            if request.hard_delete:
+                item.delete()
+            else:
+                item.move_to_trash()
             return ActionResult(id=request.id, status="deleted")
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc, item_id=request.id) from exc

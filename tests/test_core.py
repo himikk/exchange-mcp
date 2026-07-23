@@ -19,19 +19,23 @@ from exchange_mcp.ews.email import _validate_inline_images
 from exchange_mcp.exchange_client import EWSExchangeBackend, ExchangeClient
 from exchange_mcp.models import (
     CalendarEvent,
+    CompleteTaskRequest,
     CreateEventRequest,
+    CreateTaskRequest,
     DeleteContactRequest,
     EmailAddress,
     FindFreeSlotsRequest,
     InlineImage,
     ListEmailsRequest,
     ListEventsRequest,
+    ListTasksRequest,
     MarkEmailRequest,
     SearchEmailsRequest,
     SendEmailRequest,
     SendResult,
     UpdateContactRequest,
     UpdateEventRequest,
+    UpdateTaskRequest,
 )
 from exchange_mcp.server import build_mcp_server
 
@@ -50,7 +54,8 @@ def settings(monkeypatch):
 def backend(settings):
     backend = EWSExchangeBackend(settings)
     backend._account = SimpleNamespace(
-        default_timezone=UTC, calendar="cal", contacts="contacts", drafts="drafts", protocol=None
+        default_timezone=UTC, calendar="cal", contacts="contacts", drafts="drafts",
+        protocol=None, tasks="tasks",
     )
     return backend
 
@@ -478,3 +483,152 @@ def test_send_email_optional_params_not_required_in_schema(settings):
     tools = _tools(build_mcp_server(settings=settings, client=object()))
     assert "inline_images" not in tools["send_email"].inputSchema["required"]
     assert "inline_images" not in tools["create_draft"].inputSchema["required"]
+
+
+# --- tasks ---------------------------------------------------------------------
+
+
+class FakeTask:
+    def __init__(self):
+        self.id = "t1"
+        self.subject = "original"
+        self.body = None
+        self.status = "NotStarted"
+        self.percent_complete = 0
+        self.due_date = None
+        self.start_date = None
+        self.complete_date = None
+        self.reminder_is_set = False
+        self.reminder_minutes_before_start = 0
+        self.categories = []
+        self.importance = "Normal"
+        self.companies = []
+        self.contacts = []
+        self.billing_information = None
+        self.owner = None
+        self.last_modified_time = None
+        self.is_complete = False
+        self.has_attachments = False
+        self.saved_with = None
+        self.deleted = None
+        self.trashed = False
+        self.text_body = None
+
+    def save(self, update_fields=None):
+        self.saved_with = update_fields
+
+    def delete(self, **kwargs):
+        self.deleted = kwargs
+
+    def move_to_trash(self):
+        self.trashed = True
+
+
+class FakeTaskQS:
+    def __init__(self):
+        self.filters = []
+
+    def all(self):
+        return self
+
+    def order_by(self, *_):
+        return self
+
+    def filter(self, **kwargs):
+        self.filters.append(kwargs)
+        return self
+
+    def __getitem__(self, _):
+        return []
+
+
+class FakeTasksFolder:
+    def __init__(self):
+        self.qs = FakeTaskQS()
+
+    def all(self):
+        return self.qs.all()
+
+
+def test_create_task_request_date_validation():
+    with pytest.raises(ValueError):
+        CreateTaskRequest(
+            subject="s",
+            start_date=date(2026, 8, 5),
+            due_date=date(2026, 8, 1),
+        )
+
+
+def test_update_task_request_date_validation():
+    with pytest.raises(ValueError):
+        UpdateTaskRequest(
+            id="x",
+            start_date=date(2026, 8, 5),
+            due_date=date(2026, 8, 1),
+        )
+
+
+def test_list_tasks_filters(backend):
+    folder = FakeTasksFolder()
+    backend._account.tasks = folder
+    backend.list_tasks(ListTasksRequest(status="in_progress", incomplete_only=True, category="work"))
+    filters = folder.qs.filters[0]
+    assert filters["status"] == "InProgress"
+    assert filters["is_complete"] is False
+    assert filters["categories__contains"] == "work"
+
+
+def test_update_task_percent_complete_transitions_status(backend):
+    item = FakeTask()
+    backend._fetch_item = lambda _id, folder=None: item
+    backend.update_task(UpdateTaskRequest(id="x", percent_complete=50))
+    assert item.percent_complete == 50
+    assert item.status == "InProgress"
+    assert "percent_complete" in item.saved_with
+    assert "status" in item.saved_with
+
+
+def test_update_task_100_marks_completed(backend):
+    item = FakeTask()
+    backend._fetch_item = lambda _id, folder=None: item
+    backend.update_task(UpdateTaskRequest(id="x", percent_complete=100))
+    assert item.status == "Completed"
+    assert "complete_date" not in item.saved_with  # server-computed, not written
+    assert "status" in item.saved_with
+
+
+def test_complete_task_sets_fields(backend):
+    item = FakeTask()
+    backend._fetch_item = lambda _id, folder=None: item
+    result = backend.complete_task(CompleteTaskRequest(id="x"))
+    assert item.status == "Completed"
+    assert item.percent_complete == 100
+    assert result.status == "completed"
+    assert set(result.updated_fields) == {"status", "percent_complete"}
+
+
+def test_delete_task_soft_delete_by_default(backend):
+    item = FakeTask()
+    backend._fetch_item = lambda _id, folder=None: item
+    from exchange_mcp.models import DeleteTaskRequest
+
+    backend.delete_task(DeleteTaskRequest(id="x"))
+    assert item.trashed and item.deleted is None
+
+
+def test_delete_task_hard_delete(backend):
+    item = FakeTask()
+    backend._fetch_item = lambda _id, folder=None: item
+    from exchange_mcp.models import DeleteTaskRequest
+
+    backend.delete_task(DeleteTaskRequest(id="x", hard_delete=True))
+    assert item.deleted is not None and not item.trashed
+
+
+def test_task_tools_schema(settings):
+    tools = _tools(build_mcp_server(settings=settings, client=object()))
+    assert tools["create_task"].inputSchema["required"] == ["subject"]
+    assert tools["update_task"].inputSchema["required"] == ["id"]
+    assert tools["complete_task"].inputSchema["required"] == ["id"]
+    assert tools["delete_task"].inputSchema["required"] == ["id"]
+    assert tools["list_tasks"].inputSchema.get("required", []) == []

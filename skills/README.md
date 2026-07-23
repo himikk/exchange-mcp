@@ -9,6 +9,7 @@ Load only the skill(s) relevant to the task — they are independent.
 | [`exchange-email`](exchange-email/SKILL.md) | 15 | Reading, searching, sending, organizing mail; managing folders, drafts, attachments |
 | [`exchange-calendar`](exchange-calendar/SKILL.md) | 9 | Listing/creating/updating/deleting events, responding to invites, finding free slots, availability |
 | [`exchange-contacts`](exchange-contacts/SKILL.md) | 5 | Searching the GAL and personal contacts, CRUD on personal contacts |
+| [`exchange-tasks`](exchange-tasks/SKILL.md) | 6 | Listing/creating/updating/completing/deleting tasks (to-do items) |
 | [`exchange-mailbox`](exchange-mailbox/SKILL.md) | 2 | Health checks and mailbox metadata (size, quota, timezone, server version) |
 
 ## Prerequisite
@@ -29,6 +30,7 @@ Symlink (recommended, stays in sync with the repo):
 ln -s "$PWD/skills/exchange-email"      ~/.config/opencode/skills/exchange-email
 ln -s "$PWD/skills/exchange-calendar"   ~/.config/opencode/skills/exchange-calendar
 ln -s "$PWD/skills/exchange-contacts"   ~/.config/opencode/skills/exchange-contacts
+ln -s "$PWD/skills/exchange-tasks"      ~/.config/opencode/skills/exchange-tasks
 ln -s "$PWD/skills/exchange-mailbox"    ~/.config/opencode/skills/exchange-mailbox
 ```
 
@@ -45,6 +47,7 @@ mkdir -p .claude/skills
 ln -s "$PWD/skills/exchange-email"      .claude/skills/exchange-email
 ln -s "$PWD/skills/exchange-calendar"   .claude/skills/exchange-calendar
 ln -s "$PWD/skills/exchange-contacts"   .claude/skills/exchange-contacts
+ln -s "$PWD/skills/exchange-tasks"      .claude/skills/exchange-tasks
 ln -s "$PWD/skills/exchange-mailbox"    .claude/skills/exchange-mailbox
 ```
 

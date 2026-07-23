@@ -42,6 +42,14 @@ from .ews.email import (
     send_email,
 )
 from .ews.system import get_mailbox_info, ping_exchange
+from .ews.tasks import (
+    complete_task,
+    create_task,
+    delete_task,
+    get_task,
+    list_tasks,
+    update_task,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +101,12 @@ class ToolRegistry:
             "create_contact": create_contact,
             "update_contact": update_contact,
             "delete_contact": delete_contact,
+            "list_tasks": list_tasks,
+            "get_task": get_task,
+            "create_task": create_task,
+            "update_task": update_task,
+            "complete_task": complete_task,
+            "delete_task": delete_task,
         }
 
     def call(self, name: str, arguments: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
@@ -191,12 +205,15 @@ def build_mcp_server(settings: Settings | None = None, client: ExchangeClient | 
         raise RuntimeError("mcp package is required to run the server") from exc
 
     from .models import (
+        CompleteTaskRequest,
         CreateEventRequest,
         CreateFolderRequest,
         CreateContactRequest,
+        CreateTaskRequest,
         DeleteContactRequest,
         DeleteEmailRequest,
         DeleteEventRequest,
+        DeleteTaskRequest,
         DraftEmailRequest,
         FolderActionRequest,
         ForwardEmailRequest,
@@ -204,9 +221,11 @@ def build_mcp_server(settings: Settings | None = None, client: ExchangeClient | 
         GetContactRequest,
         GetEmailRequest,
         GetEventRequest,
+        GetTaskRequest,
         ListEmailsRequest,
         ListEventsRequest,
         ListFoldersRequest,
+        ListTasksRequest,
         MarkEmailRequest,
         ReplyEmailRequest,
         SearchContactsRequest,
@@ -215,6 +234,7 @@ def build_mcp_server(settings: Settings | None = None, client: ExchangeClient | 
         SendEmailRequest,
         UpdateContactRequest,
         UpdateEventRequest,
+        UpdateTaskRequest,
         FindFreeSlotsRequest,
         RespondToInviteRequest,
     )
@@ -255,6 +275,12 @@ def build_mcp_server(settings: Settings | None = None, client: ExchangeClient | 
         ("create_contact", "Create a personal contact", CreateContactRequest),
         ("update_contact", "Update a personal contact", UpdateContactRequest),
         ("delete_contact", "Delete a personal contact", DeleteContactRequest),
+        ("list_tasks", "List tasks (filter by status, category, due date, incomplete)", ListTasksRequest),
+        ("get_task", "Get a task by ID", GetTaskRequest),
+        ("create_task", "Create a task", CreateTaskRequest),
+        ("update_task", "Update a task (subject, body, dates, percent_complete, reminder, categories, importance)", UpdateTaskRequest),
+        ("complete_task", "Mark a task as completed (sets status=Completed, percent=100)", CompleteTaskRequest),
+        ("delete_task", "Delete a task", DeleteTaskRequest),
     ]
 
     for name, description, model in tool_configs:

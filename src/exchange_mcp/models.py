@@ -454,6 +454,97 @@ class DeleteContactRequest(ExchangeModel):
     id: str
 
 
+# --- Tasks ----------------------------------------------------------------
+
+
+TaskStatus = Literal["not_started", "in_progress", "completed", "waiting_on_others", "deferred"]
+
+
+class TaskSummary(ExchangeModel):
+    id: str
+    subject: str
+    status: TaskStatus
+    percent_complete: int = Field(ge=0, le=100, default=0)
+    due_date: date | None = None
+    start_date: date | None = None
+    is_complete: bool = False
+    has_attachments: bool = False
+    importance: Literal["low", "normal", "high"] = "normal"
+    categories: list[str] = Field(default_factory=list)
+    reminder_is_set: bool = False
+
+
+class TaskFull(TaskSummary):
+    body: str | None = None
+    body_type: Literal["text", "html"] = "text"
+    complete_date: date | None = None
+    reminder_minutes_before_start: int | None = None
+    companies: list[str] = Field(default_factory=list)
+    contacts: list[str] = Field(default_factory=list)
+    billing_information: str | None = None
+    owner: str | None = None
+    last_modified_time: datetime | None = None
+
+
+class ListTasksRequest(ExchangeModel):
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+    status: TaskStatus | None = None
+    category: str | None = None
+    due_before: date | None = None
+    due_after: date | None = None
+    incomplete_only: bool = False
+
+
+class GetTaskRequest(ExchangeModel):
+    id: str
+
+
+class CreateTaskRequest(ExchangeModel):
+    subject: str = Field(min_length=1)
+    body: str | None = None
+    body_type: Literal["text", "html"] = "text"
+    start_date: date | None = None
+    due_date: date | None = None
+    reminder_minutes: int | None = Field(default=None, ge=0, le=10080)
+    categories: list[str] = Field(default_factory=list)
+    importance: Literal["low", "normal", "high"] = "normal"
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> "CreateTaskRequest":
+        if self.start_date and self.due_date and self.due_date < self.start_date:
+            raise ValueError("due_date must be greater than or equal to start_date")
+        return self
+
+
+class UpdateTaskRequest(ExchangeModel):
+    id: str
+    subject: str | None = Field(default=None, min_length=1)
+    body: str | None = None
+    body_type: Literal["text", "html"] = "text"
+    start_date: date | None = None
+    due_date: date | None = None
+    percent_complete: int | None = Field(default=None, ge=0, le=100)
+    reminder_minutes: int | None = Field(default=None, ge=0, le=10080)
+    categories: list[str] | None = None
+    importance: Literal["low", "normal", "high"] | None = None
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> "UpdateTaskRequest":
+        if self.start_date and self.due_date and self.due_date < self.start_date:
+            raise ValueError("due_date must be greater than or equal to start_date")
+        return self
+
+
+class CompleteTaskRequest(ExchangeModel):
+    id: str
+
+
+class DeleteTaskRequest(ExchangeModel):
+    id: str
+    hard_delete: bool = False
+
+
 def dump_model(value: BaseModel | list[BaseModel] | dict[str, Any] | list[dict[str, Any]]) -> Any:
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json", by_alias=True)
