@@ -102,6 +102,11 @@ class GetEmailRequest(ExchangeModel):
     id: str
 
 
+class InlineImage(ExchangeModel):
+    path: Path
+    content_id: str = Field(min_length=1, description="CID used in the HTML body via cid:<content_id>")
+
+
 class SendEmailRequest(ExchangeModel):
     to: list[EmailStr] = Field(min_length=1)
     subject: str = Field(min_length=1)
@@ -111,6 +116,7 @@ class SendEmailRequest(ExchangeModel):
     bcc: list[EmailStr] = Field(default_factory=list)
     reply_to: EmailStr | None = None
     attachments: list[Path] = Field(default_factory=list)
+    inline_images: list[InlineImage] = Field(default_factory=list)
     importance: Literal["low", "normal", "high"] = "normal"
 
 
@@ -163,6 +169,7 @@ class DraftEmailRequest(ExchangeModel):
     cc: list[EmailStr] = Field(default_factory=list)
     bcc: list[EmailStr] = Field(default_factory=list)
     attachments: list[Path] = Field(default_factory=list)
+    inline_images: list[InlineImage] = Field(default_factory=list)
 
 
 class SendDraftRequest(ExchangeModel):

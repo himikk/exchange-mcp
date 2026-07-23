@@ -93,9 +93,12 @@ Supported keywords: `from:`, `to:`, `subject:`, `body:`, `hasattachment:` (`true
 | `bcc` | list[email] | `[]` | |
 | `reply_to` | email | – | Reply-to header |
 | `attachments` | list[path] | `[]` | **Filesystem paths** to attach |
+| `inline_images` | list[{path, content_id}] | `[]` | Inline CID images; reference in HTML body as `cid:<content_id>` |
 | `importance` | `"low"` \| `"normal"` \| `"high"` | `"normal"` | |
 
 `attachments` are local file paths the MCP server reads from disk — make sure the file is reachable by the server process, not just the agent.
+
+`inline_images` embeds images directly in the HTML body (e.g. a signature logo). Each item is `{path: <filesystem path>, content_id: <string>}`. The HTML body must reference each image via `cid:<content_id>` (e.g. `<img src="cid:logo">`). Content type is inferred from the file extension (.png/.jpg/.jpeg/.gif/.svg/.webp). Requires `body_type="html"`. Capped by `ATTACHMENT_MAX_SIZE_MB` per image.
 
 #### `reply_email` — reply to a message
 
@@ -178,6 +181,7 @@ Same shape as `send_email` minus `reply_to`, `importance`, `bcc` (no `bcc` on dr
 | `body_type` | `"text"` \| `"html"` | `"text"` | |
 | `cc` | list[email] | `[]` | |
 | `attachments` | list[path] | `[]` | |
+| `inline_images` | list[{path, content_id}] | `[]` | Inline CID images; reference in HTML body as `cid:<content_id>` |
 
 #### `send_draft` — send an existing draft
 

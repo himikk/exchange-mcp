@@ -56,6 +56,7 @@ def send_email(client: ExchangeClient, arguments: dict) -> dict:
         raise validation_error_from_pydantic(exc) from exc
 
     _validate_attachments(request.attachments, client.settings.attachment_max_size_mb)
+    _validate_inline_images(request.inline_images, client.settings.attachment_max_size_mb)
     return dump_model(client.send_email(request))
 
 
@@ -131,6 +132,7 @@ def create_draft(client: ExchangeClient, arguments: dict) -> dict:
     except ValidationError as exc:
         raise validation_error_from_pydantic(exc) from exc
     _validate_attachments(request.attachments, client.settings.attachment_max_size_mb)
+    _validate_inline_images(request.inline_images, client.settings.attachment_max_size_mb)
     return dump_model(client.create_draft(request))
 
 
@@ -173,6 +175,36 @@ def _validate_attachments(attachments: list[Path], max_size_mb: int) -> None:
                 {
                     "field": "attachments",
                     "reason": f"file exceeds ATTACHMENT_MAX_SIZE_MB={max_size_mb}: {item['path']} ({item['size']} bytes)",
+                }
+                for item in oversized
+            ],
+        )
+
+
+def _validate_inline_images(images: list, max_size_mb: int) -> None:
+    paths = [image.path for image in images]
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise APIError(
+            "validation_error",
+            "one or more inline images do not exist",
+            details=[{"field": "inline_images", "reason": f"missing file: {path}"} for path in missing],
+        )
+
+    max_size_bytes = max_size_mb * 1024 * 1024
+    oversized = [
+        {"path": str(path), "size": path.stat().st_size}
+        for path in paths
+        if path.stat().st_size > max_size_bytes
+    ]
+    if oversized:
+        raise APIError(
+            "validation_error",
+            "one or more inline images exceed the configured size limit",
+            details=[
+                {
+                    "field": "inline_images",
+                    "reason": f"image exceeds ATTACHMENT_MAX_SIZE_MB={max_size_mb}: {item['path']} ({item['size']} bytes)",
                 }
                 for item in oversized
             ],

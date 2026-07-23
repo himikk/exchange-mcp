@@ -571,7 +571,30 @@ class EWSExchangeBackend:
         for path in request.attachments:
             with Path(path).open("rb") as handle:
                 message.attach(FileAttachment(name=Path(path).name, content=handle.read()))
+        for image in getattr(request, "inline_images", None) or []:
+            with Path(image.path).open("rb") as handle:
+                content = handle.read()
+            message.attach(
+                FileAttachment(
+                    name=Path(image.path).name,
+                    content=content,
+                    is_inline=True,
+                    content_id=image.content_id,
+                    content_type=self._guess_content_type(Path(image.path).suffix),
+                )
+            )
         return message
+
+    @staticmethod
+    def _guess_content_type(suffix: str) -> str:
+        return {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".svg": "image/svg+xml",
+            ".webp": "image/webp",
+        }.get(suffix.lower(), "application/octet-stream")
 
     def _to_folder_info(self, folder: Folder, depth: int) -> FolderInfo:
         children = []

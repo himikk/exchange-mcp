@@ -15,6 +15,7 @@ from exchangelib.version import EXCHANGE_2013, Version
 
 from exchange_mcp.config import Settings, get_settings
 from exchange_mcp.errors import APIError
+from exchange_mcp.ews.email import _validate_inline_images
 from exchange_mcp.exchange_client import EWSExchangeBackend, ExchangeClient
 from exchange_mcp.models import (
     CalendarEvent,
@@ -22,10 +23,12 @@ from exchange_mcp.models import (
     DeleteContactRequest,
     EmailAddress,
     FindFreeSlotsRequest,
+    InlineImage,
     ListEmailsRequest,
     ListEventsRequest,
     MarkEmailRequest,
     SearchEmailsRequest,
+    SendEmailRequest,
     SendResult,
     UpdateContactRequest,
     UpdateEventRequest,
@@ -412,3 +415,66 @@ def test_log_level_case_insensitive(monkeypatch):
 def test_exchange_client_requires_backend(settings):
     client = ExchangeClient(settings=settings, backend=object())
     assert client.backend is not None
+
+
+# --- inline images -------------------------------------------------------------
+
+
+def test_make_message_attaches_inline_images(backend, tmp_path):
+    from exchangelib import FileAttachment
+
+    logo = tmp_path / "logo.png"
+    logo.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    class CollectingMessage:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            self._attached = []
+
+        def attach(self, attachment):
+            self._attached.append(attachment)
+
+    import exchange_mcp.exchange_client as ec
+
+    OrigMessage = ec.Message
+    ec.Message = CollectingMessage
+    try:
+        request = SendEmailRequest(
+            to=["a@b.com"],
+            subject="s",
+            body='<img src="cid:logo">',
+            body_type="html",
+            inline_images=[InlineImage(path=logo, content_id="logo")],
+        )
+        message = backend._make_message(request)
+    finally:
+        ec.Message = OrigMessage
+
+    inline = [a for a in message._attached if isinstance(a, FileAttachment)]
+    assert len(inline) == 1
+    assert inline[0].is_inline is True
+    assert inline[0].content_id == "logo"
+    assert inline[0].content_type == "image/png"
+    assert inline[0].name == "logo.png"
+
+
+def test_validate_inline_images_missing_path(tmp_path):
+    missing = tmp_path / "nope.png"
+    with pytest.raises(APIError) as excinfo:
+        _validate_inline_images([InlineImage(path=missing, content_id="logo")], max_size_mb=10)
+    assert excinfo.value.code == "validation_error"
+    assert "inline_images" in str(excinfo.value.details)
+
+
+def test_validate_inline_images_size_cap(tmp_path):
+    image = tmp_path / "big.png"
+    image.write_bytes(b"x" * (11 * 1024 * 1024))
+    with pytest.raises(APIError) as excinfo:
+        _validate_inline_images([InlineImage(path=image, content_id="logo")], max_size_mb=10)
+    assert excinfo.value.code == "validation_error"
+
+
+def test_send_email_optional_params_not_required_in_schema(settings):
+    tools = _tools(build_mcp_server(settings=settings, client=object()))
+    assert "inline_images" not in tools["send_email"].inputSchema["required"]
+    assert "inline_images" not in tools["create_draft"].inputSchema["required"]
