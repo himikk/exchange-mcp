@@ -5,7 +5,7 @@ import re
 import tempfile
 import warnings
 from collections.abc import Iterable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -40,9 +40,11 @@ from exchangelib.errors import (
 from exchangelib.indexed_properties import EmailAddress as IndexedEmailAddress
 from exchangelib.indexed_properties import PhoneNumber as IndexedPhoneNumber
 from exchangelib.items import Contact
-from exchangelib.properties import FreeBusyViewOptions, ItemId, MailboxData, TimeWindow
-from exchangelib.protocol import BaseProtocol, FailFast, FaultTolerance
-from exchangelib.services import GetUserAvailability, ResolveNames
+from exchangelib.properties import ItemId
+from exchangelib.protocol import BaseProtocol, FailFast, FaultTolerance, NoVerifyHTTPAdapter
+from exchangelib.services import ResolveNames
+from exchangelib import version as ews_version
+from requests.adapters import HTTPAdapter
 from urllib3.exceptions import InsecureRequestWarning
 
 from .auth import build_auth_context
@@ -103,11 +105,15 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
-_RAW_SESSION_PATCHED = False
-_TIMEZONE_FALLBACK_PATCHED = False
+_TZ_FROM_MS_ID_ORIGINAL = None
 _GUID_TIMEZONE_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+
+def _aqs_quote(value: str) -> str:
+    """Quote a value for embedding in an AQS query string."""
+    return '"' + value.replace("\\", "").replace('"', "") + '"'
 
 
 class ExchangeBackend(Protocol):
@@ -144,113 +150,10 @@ class ExchangeBackend(Protocol):
     def delete_contact(self, request: DeleteContactRequest) -> ActionResult: ...
 
 
-class UnconfiguredExchangeBackend:
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-
-    def _raise(self) -> None:
-        raise ExchangeUnavailableError(
-            "exchange backend is not configured; provide a real EWS-backed implementation"
-        )
-
-    def ping(self) -> PingResult:
-        self._raise()
-
-    def get_mailbox_info(self) -> MailboxInfo:
-        self._raise()
-
-    def list_emails(self, request: ListEmailsRequest) -> list[EmailSummary]:
-        self._raise()
-
-    def get_email(self, request: GetEmailRequest) -> EmailFull:
-        self._raise()
-
-    def send_email(self, request: SendEmailRequest) -> SendResult:
-        self._raise()
-
-    def search_emails(self, request: SearchEmailsRequest) -> list[EmailSummary]:
-        self._raise()
-
-    def reply_email(self, request: ReplyEmailRequest) -> SendResult:
-        self._raise()
-
-    def forward_email(self, request: ForwardEmailRequest) -> SendResult:
-        self._raise()
-
-    def move_email(self, request: FolderActionRequest) -> ActionResult:
-        self._raise()
-
-    def copy_email(self, request: FolderActionRequest) -> ActionResult:
-        self._raise()
-
-    def delete_email(self, request: DeleteEmailRequest) -> ActionResult:
-        self._raise()
-
-    def mark_email(self, request: MarkEmailRequest) -> ActionResult:
-        self._raise()
-
-    def list_folders(self, request: ListFoldersRequest) -> list[FolderInfo]:
-        self._raise()
-
-    def create_folder(self, request: CreateFolderRequest) -> ActionResult:
-        self._raise()
-
-    def create_draft(self, request: DraftEmailRequest) -> ActionResult:
-        self._raise()
-
-    def send_draft(self, request: SendDraftRequest) -> ActionResult:
-        self._raise()
-
-    def get_attachment(self, request: GetAttachmentRequest) -> AttachmentResult:
-        self._raise()
-
-    def list_events(self, request: ListEventsRequest) -> list[CalendarEvent]:
-        self._raise()
-
-    def get_event(self, request: GetEventRequest) -> CalendarEvent:
-        self._raise()
-
-    def create_event(self, request: CreateEventRequest) -> CreateEventResult:
-        self._raise()
-
-    def update_event(self, request: UpdateEventRequest) -> ActionResult:
-        self._raise()
-
-    def delete_event(self, request: DeleteEventRequest) -> ActionResult:
-        self._raise()
-
-    def respond_to_invite(self, request: RespondToInviteRequest) -> ActionResult:
-        self._raise()
-
-    def find_free_slots(self, request: FindFreeSlotsRequest) -> list[FreeSlot]:
-        self._raise()
-
-    def get_my_availability(self, request: ListEventsRequest) -> AvailabilityResult:
-        self._raise()
-
-    def list_calendars(self) -> list[CalendarInfo]:
-        self._raise()
-
-    def search_contacts(self, request: SearchContactsRequest) -> list[ContactSummary]:
-        self._raise()
-
-    def get_contact(self, request: GetContactRequest) -> ContactFull:
-        self._raise()
-
-    def create_contact(self, request: CreateContactRequest) -> ActionResult:
-        self._raise()
-
-    def update_contact(self, request: UpdateContactRequest) -> ActionResult:
-        self._raise()
-
-    def delete_contact(self, request: DeleteContactRequest) -> ActionResult:
-        self._raise()
-
-
 class ExchangeClient:
-    def __init__(self, settings: Settings, backend: ExchangeBackend | None = None) -> None:
+    def __init__(self, settings: Settings, backend: ExchangeBackend) -> None:
         self.settings = settings
-        self.backend = backend or UnconfiguredExchangeBackend(settings)
+        self.backend = backend
 
     def ping(self) -> PingResult:
         return self.backend.ping()
@@ -384,6 +287,7 @@ class EWSExchangeBackend:
             credentials=credentials,
             auth_type=auth_type,
             retry_policy=retry_policy,
+            version=self._exchange_version(),
         )
         access_type = IMPERSONATION if auth.impersonate_as else DELEGATE
         try:
@@ -404,39 +308,36 @@ class EWSExchangeBackend:
             endpoint = endpoint.rstrip("/") + "/EWS/Exchange.asmx"
         return endpoint
 
-    def _configure_ssl_verification(self) -> None:
-        global _RAW_SESSION_PATCHED
-        if _RAW_SESSION_PATCHED:
-            return
-
-        verify_ssl = self.settings.exchange_verify_ssl
-        original = BaseProtocol.raw_session.__func__
-
-        def raw_session_with_verify(cls, prefix, oauth2_client=None, oauth2_session_params=None, oauth2_token_endpoint=None):
-            session = original(
-                cls,
-                prefix,
-                oauth2_client=oauth2_client,
-                oauth2_session_params=oauth2_session_params,
-                oauth2_token_endpoint=oauth2_token_endpoint,
+    def _exchange_version(self) -> ews_version.Version | None:
+        if not self.settings.exchange_version:
+            return None
+        name = self.settings.exchange_version.upper()
+        build = getattr(ews_version, name, None)
+        if not isinstance(build, ews_version.Build):
+            build = next((b for b, api, _ in ews_version.VERSIONS if api.upper() == name), None)
+        if not isinstance(build, ews_version.Build):
+            supported = sorted(n for n in dir(ews_version) if n.startswith("EXCHANGE_"))
+            raise APIError(
+                "validation_error",
+                f"unknown EXCHANGE_VERSION: {self.settings.exchange_version}",
+                details=[{"field": "EXCHANGE_VERSION", "reason": f"supported values: {', '.join(supported)}"}],
             )
-            session.verify = verify_ssl
-            return session
+        return ews_version.Version(build)
 
-        BaseProtocol.raw_session = classmethod(raw_session_with_verify)
-        _RAW_SESSION_PATCHED = True
-
-        if not verify_ssl:
-            warnings.filterwarnings("ignore", category=InsecureRequestWarning)
-            logger.warning("SSL certificate verification is disabled for Exchange connections")
+    def _configure_ssl_verification(self) -> None:
+        if self.settings.exchange_verify_ssl:
+            BaseProtocol.HTTP_ADAPTER_CLS = HTTPAdapter
+            return
+        BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
+        warnings.filterwarnings("ignore", category=InsecureRequestWarning)
+        logger.warning("SSL certificate verification is disabled for Exchange connections")
 
     def _configure_timezone_fallback(self) -> None:
-        global _TIMEZONE_FALLBACK_PATCHED
-        if _TIMEZONE_FALLBACK_PATCHED:
-            return
-
+        global _TZ_FROM_MS_ID_ORIGINAL
+        if _TZ_FROM_MS_ID_ORIGINAL is None:
+            _TZ_FROM_MS_ID_ORIGINAL = EWSTimeZone.from_ms_id.__func__
+        original = _TZ_FROM_MS_ID_ORIGINAL
         fallback_timezone = self.settings.exchange_timezone
-        original = EWSTimeZone.from_ms_id.__func__
 
         def from_ms_id_with_fallback(cls, ms_id):
             try:
@@ -452,19 +353,12 @@ class EWSExchangeBackend:
                 raise
 
         EWSTimeZone.from_ms_id = classmethod(from_ms_id_with_fallback)
-        _TIMEZONE_FALLBACK_PATCHED = True
 
     def _resolve_folder(self, value: str | None) -> Folder:
         account = self.account
         if not value or value == "root":
             return account.root
         normalized = value.strip("/").lower()
-        archive_root = account.root
-        if normalized == "archive":
-            try:
-                archive_root = account.archive_root
-            except Exception:  # noqa: BLE001
-                archive_root = account.root
         builtin = {
             "inbox": account.inbox,
             "входящие": account.inbox,
@@ -708,12 +602,9 @@ class EWSExchangeBackend:
             return AuthFailedError()
         if isinstance(exc, RateLimitError):
             return ExchangeUnavailableError("exchange throttling or rate limit encountered")
-        if isinstance(exc, (TransportError, TimeoutError)):
-            if "timed out" in message.lower():
-                return TimeoutAPIError(self.settings.exchange_timeout)
-            return ExchangeUnavailableError(message)
         if isinstance(exc, (ErrorItemSavePropertyError, ErrorFolderSavePropertyError)):
             return ConflictError(message)
+        # ResponseMessageError subclasses TransportError, so it must be checked first
         if isinstance(exc, ResponseMessageError):
             lowered = message.lower()
             if "not found" in lowered and item_id:
@@ -721,15 +612,17 @@ class EWSExchangeBackend:
             if "access is denied" in lowered or "permission" in lowered:
                 return PermissionDeniedError()
             return APIError("exchange_error", message)
+        if isinstance(exc, (TransportError, TimeoutError)):
+            if "timed out" in message.lower():
+                return TimeoutAPIError(self.settings.exchange_timeout)
+            return ExchangeUnavailableError(message)
         return ExchangeUnavailableError(message)
 
     def ping(self) -> PingResult:
         started = datetime.now(UTC)
         account = self.account
         try:
-            inbox = account.inbox
-            count = inbox.total_count
-            del count
+            account.inbox.refresh()
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc) from exc
         latency_ms = round((datetime.now(UTC) - started).total_seconds() * 1000)
@@ -750,26 +643,47 @@ class EWSExchangeBackend:
     def list_emails(self, request: ListEmailsRequest) -> list[EmailSummary]:
         folder = self._resolve_folder(request.folder)
         qs = folder.all().order_by("-datetime_received")
-        filters: dict[str, Any] = {}
         if request.from_address:
-            filters["author__email_address"] = str(request.from_address)
-        if request.subject:
-            filters["subject__icontains"] = request.subject
-        if request.since:
-            filters["datetime_received__gte"] = datetime.combine(request.since, datetime.min.time(), tzinfo=self.account.default_timezone)
-        if request.before:
-            filters["datetime_received__lt"] = datetime.combine(request.before + timedelta(days=1), datetime.min.time(), tzinfo=self.account.default_timezone)
-        if request.unread_only:
-            filters["is_read"] = False
-        if request.has_attachments is not None:
-            filters["has_attachments"] = request.has_attachments
-        if filters:
-            qs = qs.filter(**filters)
+            # EWS restrictions cannot filter on the sender's email address, and AQS
+            # query strings cannot be combined with restrictions, so the whole
+            # filter must be expressed as AQS here.
+            qs = qs.filter(self._aqs_list_query(request))
+        else:
+            filters: dict[str, Any] = {}
+            if request.subject:
+                filters["subject__icontains"] = request.subject
+            if request.since:
+                filters["datetime_received__gte"] = datetime.combine(request.since, datetime.min.time(), tzinfo=self.account.default_timezone)
+            if request.before:
+                filters["datetime_received__lt"] = datetime.combine(request.before + timedelta(days=1), datetime.min.time(), tzinfo=self.account.default_timezone)
+            if request.unread_only:
+                filters["is_read"] = False
+            if request.has_attachments is not None:
+                filters["has_attachments"] = request.has_attachments
+            if filters:
+                qs = qs.filter(**filters)
         try:
             items = list(qs[request.offset : request.offset + request.limit])
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc) from exc
         return [self._to_email_summary(item) for item in items]
+
+    @staticmethod
+    def _aqs_list_query(request: ListEmailsRequest) -> str:
+        parts = [f"from:{_aqs_quote(str(request.from_address))}"]
+        if request.subject:
+            parts.append(f"subject:{_aqs_quote(request.subject)}")
+        if request.since and request.before:
+            parts.append(f"received:{request.since.isoformat()}..{request.before.isoformat()}")
+        elif request.since:
+            parts.append(f"received:>={request.since.isoformat()}")
+        elif request.before:
+            parts.append(f"received:<={request.before.isoformat()}")
+        if request.unread_only:
+            parts.append("isread:false")
+        if request.has_attachments is not None:
+            parts.append(f"hasattachment:{str(request.has_attachments).lower()}")
+        return " AND ".join(parts)
 
     def get_email(self, request: GetEmailRequest) -> EmailFull:
         item = self._fetch_item(request.id)
@@ -777,21 +691,14 @@ class EWSExchangeBackend:
 
     def search_emails(self, request: SearchEmailsRequest) -> list[EmailSummary]:
         folder = self._resolve_folder(request.folder) if request.folder else self.account.inbox
-        items: list[Any] = []
-        # Try subject search first
+        # AQS query string: a bare term is searched server-side across all indexed
+        # properties (subject, body, sender, recipients) using the content index.
+        # AQS keywords like from:, subject:, hasattachment: are passed through as-is.
         try:
-            qs = folder.filter(subject__icontains=request.query).order_by("-datetime_received")
+            qs = folder.filter(request.query).order_by("-datetime_received")
             items = list(qs[: request.limit])
         except Exception as exc:  # noqa: BLE001
-            # Exchange may reject certain filter combinations, fall through to empty results
-            logger.debug("subject search failed: %s", exc)
-        # Try body search if subject search returned nothing
-        if not items:
-            try:
-                qs = folder.filter(text_body__icontains=request.query).order_by("-datetime_received")
-                items = list(qs[: request.limit])
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("body search failed: %s", exc)
+            raise self._map_exception(exc) from exc
         return [self._to_email_summary(item) for item in items]
 
     def send_email(self, request: SendEmailRequest) -> SendResult:
@@ -809,7 +716,10 @@ class EWSExchangeBackend:
                 item.reply_all(subject=f"Re: {item.subject or ''}", body=request.body)
             else:
                 item.reply(subject=f"Re: {item.subject or ''}", body=request.body)
-            return SendResult(id=request.id, status="sent")
+            warning = None
+            if request.attachments:
+                warning = "EWS reply does not support attachments; they were not included"
+            return SendResult(id=request.id, status="sent", warning=warning)
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc, item_id=request.id) from exc
 
@@ -821,7 +731,10 @@ class EWSExchangeBackend:
                 body=request.comment or "",
                 to_recipients=[self._mailbox(address) for address in request.to],
             )
-            return SendResult(id=request.id, status="sent")
+            warning = None
+            if request.attachments:
+                warning = "EWS forward does not support extra attachments; they were not included"
+            return SendResult(id=request.id, status="sent", warning=warning)
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc, item_id=request.id) from exc
 
@@ -864,16 +777,20 @@ class EWSExchangeBackend:
         updated_fields: list[str] = []
         if request.read is not None:
             item.is_read = request.read
-            updated_fields.append("read")
+            updated_fields.append("is_read")
         if request.importance is not None:
             item.importance = request.importance.capitalize()
             updated_fields.append("importance")
+        warning = None
         if request.flag is not None:
             item.categories = [] if request.flag == "none" else [request.flag]
-            updated_fields.append("flag")
+            updated_fields.append("categories")
+            warning = "flag is mapped to Exchange categories (replaces existing ones); follow-up flags are not supported"
+        if not updated_fields:
+            return ActionResult(id=request.id, status="updated", updated_fields=[])
         try:
-            item.save(update_fields=updated_fields or None)
-            return ActionResult(id=request.id, status="updated", updated_fields=updated_fields)
+            item.save(update_fields=updated_fields)
+            return ActionResult(id=request.id, status="updated", updated_fields=updated_fields, warning=warning)
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc, item_id=request.id) from exc
 
@@ -912,20 +829,38 @@ class EWSExchangeBackend:
         target_dir.mkdir(parents=True, exist_ok=True)
         for attachment in getattr(item, "attachments", None) or []:
             attachment_id = getattr(getattr(attachment, "attachment_id", None), "id", None)
-            if attachment_id == request.attachment_id:
-                filename = getattr(attachment, "name", "attachment.bin")
-                path = self._unique_path(target_dir / filename)
-                content = getattr(attachment, "content", None)
-                if content is None:
-                    _ = attachment.content
-                    content = attachment.content
-                path.write_bytes(content)
-                return AttachmentResult(
-                    filename=filename,
-                    size=len(content),
-                    saved_path=str(path),
-                    content_type=getattr(attachment, "content_type", None),
+            if attachment_id != request.attachment_id:
+                continue
+            if not isinstance(attachment, FileAttachment):
+                raise APIError(
+                    "validation_error",
+                    f"attachment {request.attachment_id} is an embedded item, not a file",
                 )
+            max_size_bytes = self.settings.attachment_max_size_mb * 1024 * 1024
+            declared_size = getattr(attachment, "size", None)
+            if declared_size is not None and declared_size > max_size_bytes:
+                raise APIError(
+                    "validation_error",
+                    "attachment exceeds the configured size limit",
+                    details=[{"field": "attachment_id", "reason": f"size {declared_size} exceeds ATTACHMENT_MAX_SIZE_MB={self.settings.attachment_max_size_mb}"}],
+                )
+            content = attachment.content
+            if len(content) > max_size_bytes:
+                raise APIError(
+                    "validation_error",
+                    "attachment exceeds the configured size limit",
+                    details=[{"field": "attachment_id", "reason": f"size {len(content)} exceeds ATTACHMENT_MAX_SIZE_MB={self.settings.attachment_max_size_mb}"}],
+                )
+            # Strip any directory components from the server-provided name
+            filename = Path(getattr(attachment, "name", None) or "attachment.bin").name or "attachment.bin"
+            path = self._unique_path(target_dir / filename)
+            path.write_bytes(content)
+            return AttachmentResult(
+                filename=filename,
+                size=len(content),
+                saved_path=str(path),
+                content_type=getattr(attachment, "content_type", None),
+            )
         raise NotFoundError(request.attachment_id)
 
     def _unique_path(self, path: Path) -> Path:
@@ -953,7 +888,11 @@ class EWSExchangeBackend:
         folder = self.account.calendar if not request.calendar_id else self._resolve_folder(request.calendar_id)
         start = self._to_ews_datetime(request.start)
         end = self._to_ews_datetime(request.end)
-        qs = folder.view(start=start, end=end)
+        if request.include_recurring:
+            qs = folder.view(start=start, end=end)
+        else:
+            # A restriction-based query returns recurring masters unexpanded
+            qs = folder.filter(start__lt=end, end__gt=start)
         try:
             items = list(qs)
         except Exception as exc:  # noqa: BLE001
@@ -984,6 +923,11 @@ class EWSExchangeBackend:
         )
         try:
             item.save(send_meeting_invitations="SendToAllAndSaveCopy" if request.attendees else "SendToNone")
+            warnings = []
+            if request.recurrence:
+                warnings.append("recurrence is not supported yet and was ignored")
+            if request.online_meeting:
+                warnings.append("online_meeting is not supported via EWS and was ignored")
             return CreateEventResult(
                 id=item.id or "",
                 status="created",
@@ -991,6 +935,7 @@ class EWSExchangeBackend:
                 start=start,
                 end=end,
                 invite_sent=bool(request.attendees),
+                warning="; ".join(warnings) or None,
             )
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc) from exc
@@ -1005,12 +950,12 @@ class EWSExchangeBackend:
                     value = self._to_ews_datetime(value)
                 target = "reminder_minutes_before_start" if field == "reminder_minutes" else field
                 setattr(item, target, value)
-                updated_fields.append(field)
+                updated_fields.append(target)
         if request.add_attendees:
             current = list(getattr(item, "required_attendees", None) or [])
             current.extend(Attendee(mailbox=self._mailbox(address)) for address in request.add_attendees)
             item.required_attendees = current
-            updated_fields.append("add_attendees")
+            updated_fields.append("required_attendees")
         if request.remove_attendees:
             remove_set = {address.lower() for address in request.remove_attendees}
             item.required_attendees = [
@@ -1018,14 +963,17 @@ class EWSExchangeBackend:
                 for attendee in getattr(item, "required_attendees", None) or []
                 if getattr(getattr(attendee, "mailbox", None), "email_address", "").lower() not in remove_set
             ]
-            updated_fields.append("remove_attendees")
+            if "required_attendees" not in updated_fields:
+                updated_fields.append("required_attendees")
+        if not updated_fields:
+            return ActionResult(id=request.id, status="updated", updated_fields=[])
         try:
             invitations = {
                 "none": "SendToNone",
                 "all": "SendToAllAndSaveCopy",
                 "modified": "SendOnlyToChanged",
             }[request.send_updates]
-            item.save(update_fields=updated_fields or None, send_meeting_invitations=invitations)
+            item.save(update_fields=updated_fields, send_meeting_invitations=invitations)
             return ActionResult(id=request.id, status="updated", updated_fields=updated_fields)
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc, item_id=request.id) from exc
@@ -1036,7 +984,10 @@ class EWSExchangeBackend:
             item.delete(
                 send_meeting_cancellations="SendToAllAndSaveCopy" if request.notify_attendees else "SendToNone"
             )
-            return ActionResult(id=request.id, status="deleted")
+            warning = None
+            if request.cancel_message:
+                warning = "cancel_message is not supported via EWS delete and was ignored"
+            return ActionResult(id=request.id, status="deleted", warning=warning)
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc, item_id=request.id) from exc
 
@@ -1054,57 +1005,95 @@ class EWSExchangeBackend:
             raise self._map_exception(exc, item_id=request.id) from exc
 
     def find_free_slots(self, request: FindFreeSlotsRequest) -> list[FreeSlot]:
-        tz = self.account.default_timezone
         start = self._to_ews_datetime(request.start)
         end = self._to_ews_datetime(request.end)
-        service = GetUserAvailability(protocol=self.account.protocol)
-        mailbox_data = [
-            MailboxData(email=self._mailbox(address), attendee_type="Required", exclude_conflicts=False)
-            for address in request.attendees
-        ]
+        attendees = [str(address) for address in request.attendees]
         try:
-            views = service.call(
-                tzinfo=tz,
-                mailbox_data=mailbox_data,
-                timezone=tz,
-                free_busy_view_options=FreeBusyViewOptions(
-                    time_window=TimeWindow(start=start, end=end),
-                    merged_free_busy_interval=request.duration,
-                    requested_view="DetailedMerged",
-                ),
+            views = self.account.protocol.get_free_busy_info(
+                accounts=[(address, "Required", False) for address in attendees],
+                start=start,
+                end=end,
+                merged_free_busy_interval=request.duration,
             )
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc) from exc
 
-        if not views:
+        merged_views = [getattr(view, "merged", "") or "" for view in views]
+        if not merged_views:
             return []
-        merged = getattr(views[0], "merged", "") or ""
         slots: list[FreeSlot] = []
-        cursor = start
         interval = timedelta(minutes=request.duration)
-        for symbol in merged:
+        cursor = start
+        index = 0
+        while cursor + interval <= end:
             slot_end = cursor + interval
-            if symbol == "0":
+            busy = [
+                attendee
+                for attendee, merged in zip(attendees, merged_views)
+                if index < len(merged) and merged[index] != "0"
+            ]
+            if not busy and self._within_work_hours(cursor, slot_end, request.work_hours):
                 slots.append(FreeSlot(start=cursor, end=slot_end, all_available=True, busy_attendees=[]))
             cursor = slot_end
-            if cursor >= end:
-                break
+            index += 1
         return slots
 
+    @staticmethod
+    def _within_work_hours(start: datetime, end: datetime, work_hours: Any) -> bool:
+        if work_hours is None:
+            return True
+        try:
+            wh_start = time.fromisoformat(work_hours.start)
+            wh_end = time.fromisoformat(work_hours.end)
+        except ValueError:
+            return True
+        return start.date() == end.date() and start.time() >= wh_start and end.time() <= wh_end
+
     def get_my_availability(self, request: ListEventsRequest) -> AvailabilityResult:
-        events = self.list_events(request)
+        # Declined events do not block availability. Note: self-created
+        # appointments may report my_response "unknown", so only "decline"
+        # is safe to exclude here.
+        events = sorted(
+            (event for event in self.list_events(request) if event.my_response != "decline"),
+            key=lambda event: event.start,
+        )
         busy_slots = [{"start": event.start, "end": event.end, "subject": event.subject} for event in events]
-        return AvailabilityResult(free_slots=[], busy_slots=busy_slots)
+        window_start = self._to_ews_datetime(request.start)
+        window_end = self._to_ews_datetime(request.end)
+        tz = window_start.tzinfo
+        free_slots: list[FreeSlot] = []
+        cursor = window_start
+        for event in events:
+            if event.start > cursor:
+                free_slots.append(FreeSlot(start=cursor, end=min(event.start, window_end).astimezone(tz)))
+            cursor = max(cursor, event.end.astimezone(tz))
+            if cursor >= window_end:
+                break
+        if cursor < window_end:
+            free_slots.append(FreeSlot(start=cursor, end=window_end))
+        return AvailabilityResult(free_slots=free_slots, busy_slots=busy_slots)
 
     def list_calendars(self) -> list[CalendarInfo]:
-        return [
+        default = self.account.calendar
+        calendars = [
             CalendarInfo(
-                id=self.account.calendar.id,
-                name=self.account.calendar.name,
+                id=default.id,
+                name=default.name,
                 is_default=True,
                 owner_email=self.account.primary_smtp_address,
             )
         ]
+        # Secondary calendars live as subfolders of the default Calendar folder
+        for child in getattr(default, "children", None) or []:
+            calendars.append(
+                CalendarInfo(
+                    id=getattr(child, "id", "") or "",
+                    name=child.name,
+                    is_default=False,
+                    owner_email=self.account.primary_smtp_address,
+                )
+            )
+        return calendars
 
     def _contact_summary_from_contact(self, contact: Contact, source: str) -> ContactSummary:
         emails = [entry.email for entry in getattr(contact, "email_addresses", None) or [] if getattr(entry, "email", None)]
@@ -1157,6 +1146,9 @@ class EWSExchangeBackend:
 
     def get_contact(self, request: GetContactRequest) -> ContactFull:
         item = self._fetch_item(request.id, folder=self.account.contacts)
+        birthday = getattr(item, "birthday", None)
+        if isinstance(birthday, datetime):
+            birthday = birthday.date()
         return ContactFull(
             id=item.id,
             display_name=item.display_name or item.file_as or "",
@@ -1188,7 +1180,7 @@ class EWSExchangeBackend:
             department=getattr(item, "department", None),
             manager=getattr(item, "manager", None),
             notes=getattr(item, "notes", None),
-            birthday=getattr(item, "birthday", None),
+            birthday=birthday,
             source="personal",
         )
 
@@ -1226,15 +1218,17 @@ class EWSExchangeBackend:
             value = getattr(request, request_field)
             if value is not None:
                 setattr(contact, item_field, value)
-                updated_fields.append(request_field)
+                updated_fields.append(item_field)
         if request.email is not None:
             contact.email_addresses = [IndexedEmailAddress(label="EmailAddress1", email=str(request.email))]
-            updated_fields.append("email")
+            updated_fields.append("email_addresses")
         if request.phone is not None:
             contact.phone_numbers = [IndexedPhoneNumber(label="PrimaryPhone", phone_number=request.phone)]
-            updated_fields.append("phone")
+            updated_fields.append("phone_numbers")
+        if not updated_fields:
+            return ActionResult(id=request.id, status="updated", updated_fields=[])
         try:
-            contact.save(update_fields=updated_fields or None)
+            contact.save(update_fields=updated_fields)
             return ActionResult(id=request.id, status="updated", updated_fields=updated_fields)
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc, item_id=request.id) from exc
@@ -1242,7 +1236,7 @@ class EWSExchangeBackend:
     def delete_contact(self, request: DeleteContactRequest) -> ActionResult:
         contact = self._fetch_item(request.id, folder=self.account.contacts)
         try:
-            contact.delete(delete_type="MoveToDeletedItems")
+            contact.move_to_trash()
             return ActionResult(id=request.id, status="deleted")
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc, item_id=request.id) from exc

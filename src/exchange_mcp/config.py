@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -41,6 +41,11 @@ class Settings(BaseSettings):
         alias="LOG_LEVEL",
     )
     log_file: Path | None = Field(default=None, alias="LOG_FILE")
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _normalize_log_level(cls, value: object) -> object:
+        return value.upper() if isinstance(value, str) else value
 
 
 @lru_cache(maxsize=1)

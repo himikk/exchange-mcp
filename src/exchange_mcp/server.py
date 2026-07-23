@@ -103,21 +103,6 @@ class ToolRegistry:
             return get_mailbox_info(self.client), False
         if name == "list_calendars":
             return list_calendars(self.client), False
-        if name == "resource_mailbox_folders":
-            return {"uri": "mailbox://folders", "data": list_folders(self.client, {})}, False
-        if name == "resource_mailbox_inbox":
-            return {
-                "uri": "mailbox://inbox?limit=10",
-                "data": list_emails(self.client, {"folder": "inbox", "limit": 10}),
-            }, False
-        if name == "resource_mailbox_email":
-            email_id = arguments.get("id")
-            return {"uri": f"mailbox://email/{email_id}", "data": get_email(self.client, arguments)}, False
-        if name == "resource_mailbox_drafts":
-            return {"uri": "mailbox://drafts", "data": list_emails(self.client, {"folder": "drafts"})}, False
-        if name == "resource_calendar_today":
-            now = time.time()
-            return {"uri": "calendar://today", "generated_at": now}, False
 
         handler = self._handlers.get(name)
         if not handler:
@@ -175,7 +160,7 @@ def _create_tool_handler(name: str, registry: ToolRegistry, model: type[BaseMode
             param = inspect.Parameter(
                 field_name,
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                default=field_info.default,
+                default=field_info.get_default(call_default_factory=True),
                 annotation=field_type
             )
             optional_params.append(param)
@@ -234,6 +219,7 @@ def build_mcp_server(settings: Settings | None = None, client: ExchangeClient | 
         RespondToInviteRequest,
     )
 
+    settings = settings or get_settings()
     registry = build_registry(settings=settings, client=client)
     server = FastMCP("exchange-mcp", host=settings.mcp_sse_host, port=settings.mcp_sse_port)
 
@@ -243,7 +229,7 @@ def build_mcp_server(settings: Settings | None = None, client: ExchangeClient | 
         ("list_calendars", "List calendars", None),
         ("list_emails", "List emails in a folder (supports nested paths like 'inbox/jira')", ListEmailsRequest),
         ("get_email", "Get a full email by ID", GetEmailRequest),
-        ("search_emails", "Search emails", SearchEmailsRequest),
+        ("search_emails", "Search emails server-side across subject, body, sender and recipients (supports AQS keywords: from:, to:, subject:, body:, hasattachment:, isread:, received:)", SearchEmailsRequest),
         ("send_email", "Send a new email", SendEmailRequest),
         ("reply_email", "Reply to an email", ReplyEmailRequest),
         ("forward_email", "Forward an email", ForwardEmailRequest),

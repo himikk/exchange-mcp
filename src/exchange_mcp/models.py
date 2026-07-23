@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -170,7 +170,10 @@ class SendDraftRequest(ExchangeModel):
 
 
 class SearchEmailsRequest(ExchangeModel):
-    query: str = Field(min_length=1, description="Search query - minimum 1 character required")
+    query: str = Field(
+        min_length=1,
+        description="Full-text query; a bare term matches subject, body, sender and recipients. Supports AQS keywords: from:, to:, subject:, body:, hasattachment:, isread:, received: (e.g. 'from:boss@corp.com AND hasattachment:true')",
+    )
     folder: str | None = None
     limit: int = Field(default=20, ge=1, le=100)
 
@@ -223,8 +226,9 @@ class CreateEventRequest(ExchangeModel):
         if self.end <= self.start:
             raise ValueError("end must be greater than start")
         if self.is_all_day:
+            # EWS all-day events span midnight-to-midnight, end exclusive
             self.start = datetime.combine(self.start.date(), time.min, tzinfo=self.start.tzinfo)
-            self.end = datetime.combine(self.end.date(), time.max, tzinfo=self.end.tzinfo)
+            self.end = datetime.combine(self.end.date() + timedelta(days=1), time.min, tzinfo=self.end.tzinfo)
         return self
 
 
@@ -427,8 +431,16 @@ class CreateContactRequest(ExchangeModel):
     notes: str | None = None
 
 
-class UpdateContactRequest(CreateContactRequest):
+class UpdateContactRequest(ExchangeModel):
     id: str
+    display_name: str | None = Field(default=None, min_length=1)
+    first_name: str | None = None
+    last_name: str | None = None
+    email: EmailStr | None = None
+    phone: str | None = None
+    company: str | None = None
+    job_title: str | None = None
+    notes: str | None = None
 
 
 class DeleteContactRequest(ExchangeModel):

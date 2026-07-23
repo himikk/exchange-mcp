@@ -42,11 +42,18 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/himikk/exchange-mcp"
-Repository = "https://github.com/himikkexchange-mcp"
+Repository = "https://github.com/himikk/exchange-mcp"
 Issues = "https://github.com/himikk/exchange-mcp/issues"
 
 [project.scripts]
 exchange-mcp = "exchange_mcp.server:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
