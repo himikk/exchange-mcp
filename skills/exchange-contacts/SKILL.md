@@ -34,7 +34,7 @@ Exchange exposes contacts from two sources, distinguished by the `source` field:
 
 Returns `ContactSummary` items: `id`, `display_name`, `email_addresses`, `phone_numbers`, `company`, `job_title`, `department`, `source`. Use `source` to decide what's possible next (GAL = read-only; personal = editable).
 
-The `query` matches against name, email, and (for personal) company/job title. For GAL lookups by exact email, the query still works as a substring/keyword match — no special syntax.
+The `query` matches against name, email, and (for personal) company/job title. For GAL, the query is resolved against the directory by name or email (prefix-style match) — plain text, no special syntax.
 
 ### `get_contact`
 
@@ -44,7 +44,7 @@ The `query` matches against name, email, and (for personal) company/job title. F
 
 Returns `ContactFull` with all fields: `first_name`, `last_name`, `email_addresses` (typed: `Email1`/`Email2`/...), `phone_numbers` (typed: `BusinessPhone`/`MobilePhone`/...), `addresses`, `company`, `job_title`, `department`, `manager`, `notes`, `photo_url`, `birthday`, `source`.
 
-**The `id` is source-specific** — a GAL `id` only works with `get_contact`; a personal `id` also works with `update_contact`/`delete_contact`. Always check the `source` field returned by `search_contacts` before calling a write tool.
+**The `id` is source-specific** — a GAL `id` is the person's primary email address and works with `get_contact`; a personal `id` is an EWS item id that also works with `update_contact`/`delete_contact`. Always check the `source` field returned by `search_contacts` before calling a write tool.
 
 ### `create_contact` — personal only
 
@@ -121,4 +121,4 @@ Permanent deletion from the personal Contacts folder. Not recoverable via Exchan
 - **`update_contact` overwrites `Email1`/`BusinessPhone`**, it does not append. To add a second email, you'd need a different code path (not exposed by the current tool).
 - **`delete_contact` is permanent** — no soft-delete, no Deleted Items recovery. Confirm with the user before deleting.
 - **`search_contacts` with `source="all"` may return duplicates** — a person can appear in both GAL and personal contacts with different `id`s. Disambiguate by `source` before acting.
-- **GAL search results depend on server-side resolution** — some Exchange deployments restrict which fields are visible in GAL summaries (e.g. `phone_numbers` may be empty even when `get_contact` returns them). Call `get_contact` for full fields.
+- **GAL data comes from directory resolution (ResolveNames).** Which fields are populated depends on what AD exposes per user — e.g. `phone_numbers` may be empty for some users and present for others. `notes`, `photo_url`, and `birthday` are never available for GAL contacts.

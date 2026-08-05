@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
+from pydantic import ValidationError
+
 from exchangelib import (
     Account,
     Attendee,
@@ -31,6 +33,7 @@ from exchangelib import (
 )
 from exchangelib.ewsdatetime import EWSDateTime
 from exchangelib.errors import (
+    ErrorInvalidIdMalformed,
     ErrorItemSavePropertyError,
     ErrorFolderSavePropertyError,
     RateLimitError,
@@ -69,6 +72,7 @@ from .models import (
     CalendarInfo,
     CalendarEvent,
     CompleteTaskRequest,
+    ContactEmailAddress,
     ContactFull,
     ContactSummary,
     CreateEventRequest,
@@ -529,11 +533,15 @@ class EWSExchangeBackend:
 
     def _fetch_item(self, item_id: str, folder: Folder | None = None) -> Any:
         try:
-            return next(self.account.fetch(ids=[ItemId(id=item_id, changekey=None)], folder=folder))
+            item = next(self.account.fetch(ids=[ItemId(id=item_id, changekey=None)], folder=folder))
         except StopIteration as exc:
             raise NotFoundError(item_id) from exc
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc, item_id=item_id) from exc
+        # exchangelib may yield a ResponseMessageError instead of raising it
+        if isinstance(item, Exception):
+            raise self._map_exception(item, item_id=item_id)
+        return item
 
     def _mailbox(self, address: str) -> Mailbox:
         return Mailbox(email_address=address)
@@ -743,6 +751,8 @@ class EWSExchangeBackend:
             return ExchangeUnavailableError("exchange throttling or rate limit encountered")
         if isinstance(exc, (ErrorItemSavePropertyError, ErrorFolderSavePropertyError)):
             return ConflictError(message)
+        if isinstance(exc, ErrorInvalidIdMalformed):
+            return NotFoundError(item_id) if item_id else APIError("validation_error", message)
         # ResponseMessageError subclasses TransportError, so it must be checked first
         if isinstance(exc, ResponseMessageError):
             lowered = message.lower()
@@ -1258,19 +1268,50 @@ class EWSExchangeBackend:
             )
         return calendars
 
-    def _contact_summary_from_contact(self, contact: Contact, source: str) -> ContactSummary:
-        emails = [entry.email for entry in getattr(contact, "email_addresses", None) or [] if getattr(entry, "email", None)]
+    @staticmethod
+    def _contact_emails(contact: Contact) -> list[str]:
+        """Routable emails only. GAL data carries sip:/smtp: prefixed URIs —
+        keep SMTP entries (primary first), drop non-mail schemes."""
+        primary: list[str] = []
+        aliases: list[str] = []
+        plain: list[str] = []
+        for entry in getattr(contact, "email_addresses", None) or []:
+            email = getattr(entry, "email", None)
+            if not email:
+                continue
+            if email.startswith("SMTP:"):
+                primary.append(email[5:])
+            elif email.upper().startswith("SMTP:"):
+                aliases.append(email[5:])
+            elif ":" not in email:
+                plain.append(email)
+        return primary + aliases + plain
+
+    def _contact_summary_from_contact(self, contact: Contact, source: str, fallback_id: str = "") -> ContactSummary:
         phones = [entry.phone_number for entry in getattr(contact, "phone_numbers", None) or [] if getattr(entry, "phone_number", None)]
         return ContactSummary(
-            id=contact.id,
+            id=contact.id or fallback_id,
             display_name=contact.display_name or contact.file_as or "",
-            email_addresses=emails,
+            email_addresses=self._contact_emails(contact),
             phone_numbers=phones,
             company=getattr(contact, "company_name", None),
             job_title=getattr(contact, "job_title", None),
             department=getattr(contact, "department", None),
             source=source,
         )
+
+    def _resolve_gal(self, query: str) -> list[tuple[Any, Any]]:
+        try:
+            resolved = ResolveNames(protocol=self.account.protocol).call(
+                unresolved_entries=[query],
+                return_full_contact_data=True,
+                search_scope="ActiveDirectory",
+                contact_data_shape="AllProperties",
+            )
+            # The stream may carry exceptions (e.g. ErrorNameResolutionNoResults) — treat them as "no match"
+            return [pair for pair in resolved if pair is not None and not isinstance(pair, Exception)]
+        except Exception as exc:  # noqa: BLE001
+            raise self._map_exception(exc) from exc
 
     def search_contacts(self, request: SearchContactsRequest) -> list[ContactSummary]:
         results: list[ContactSummary] = []
@@ -1281,33 +1322,29 @@ class EWSExchangeBackend:
             except Exception as exc:  # noqa: BLE001
                 raise self._map_exception(exc) from exc
         if request.source in {"gal", "all"} and len(results) < request.limit:
-            try:
-                resolved = ResolveNames(protocol=self.account.protocol).call(
-                    unresolved_entries=[request.query],
-                    return_full_contact_data=True,
-                    search_scope="ActiveDirectory",
-                    contact_data_shape="AllProperties",
-                )
-                for mailbox, contact in resolved:
-                    if contact is not None and getattr(contact, "id", None):
-                        results.append(self._contact_summary_from_contact(contact, "gal"))
-                    elif mailbox is not None:
-                        results.append(
-                            ContactSummary(
-                                id=getattr(mailbox, "email_address", None) or request.query,
-                                display_name=getattr(mailbox, "name", None) or getattr(mailbox, "email_address", None) or request.query,
-                                email_addresses=[getattr(mailbox, "email_address", None)] if getattr(mailbox, "email_address", None) else [],
-                                phone_numbers=[],
-                                source="gal",
-                            )
+            for mailbox, contact in self._resolve_gal(request.query):
+                mailbox_email = getattr(mailbox, "email_address", None) or ""
+                if contact is not None:
+                    results.append(
+                        self._contact_summary_from_contact(contact, "gal", fallback_id=mailbox_email or request.query)
+                    )
+                elif mailbox is not None:
+                    results.append(
+                        ContactSummary(
+                            id=mailbox_email or request.query,
+                            display_name=getattr(mailbox, "name", None) or mailbox_email or request.query,
+                            email_addresses=[mailbox_email] if mailbox_email else [],
+                            phone_numbers=[],
+                            source="gal",
                         )
-                    if len(results) >= request.limit:
-                        break
-            except Exception as exc:  # noqa: BLE001
-                raise self._map_exception(exc) from exc
+                    )
+                if len(results) >= request.limit:
+                    break
         return results[: request.limit]
 
     def get_contact(self, request: GetContactRequest) -> ContactFull:
+        if "@" in request.id:
+            return self._get_gal_contact(request.id)
         item = self._fetch_item(request.id, folder=self.account.contacts)
         birthday = getattr(item, "birthday", None)
         if isinstance(birthday, datetime):
@@ -1345,6 +1382,59 @@ class EWSExchangeBackend:
             notes=getattr(item, "notes", None),
             birthday=birthday,
             source="personal",
+        )
+
+    def _get_gal_contact(self, email: str) -> ContactFull:
+        fallback_mailbox = None
+        for mailbox, contact in self._resolve_gal(email):
+            if (getattr(mailbox, "email_address", None) or "").lower() != email.lower():
+                continue
+            if contact is not None:
+                return self._gal_contact_full(email, contact)
+            fallback_mailbox = mailbox
+        if fallback_mailbox is not None:
+            return ContactFull(
+                id=email,
+                display_name=getattr(fallback_mailbox, "name", None) or email,
+                email_addresses=[{"type": "SMTP", "address": email}],
+                source="gal",
+            )
+        raise NotFoundError(email)
+
+    def _gal_contact_full(self, email: str, contact: Contact) -> ContactFull:
+        email_models = []
+        for candidate in self._contact_emails(contact) or [email]:
+            try:
+                email_models.append(ContactEmailAddress(type="SMTP", address=candidate))
+            except ValidationError:
+                continue  # skip non-routable aliases (e.g. *.local) rejected by EmailStr
+        return ContactFull(
+            id=email,
+            display_name=contact.display_name or email,
+            first_name=getattr(contact, "given_name", None),
+            last_name=getattr(contact, "surname", None),
+            email_addresses=email_models,
+            phone_numbers=[
+                {"type": entry.label, "number": entry.phone_number}
+                for entry in getattr(contact, "phone_numbers", None) or []
+                if getattr(entry, "phone_number", None)
+            ],
+            addresses=[
+                {
+                    "type": entry.label,
+                    "street": entry.street,
+                    "city": entry.city,
+                    "state": entry.state,
+                    "postal_code": entry.zipcode,
+                    "country": entry.country,
+                }
+                for entry in getattr(contact, "physical_addresses", None) or []
+            ],
+            company=getattr(contact, "company_name", None),
+            job_title=getattr(contact, "job_title", None),
+            department=getattr(contact, "department", None),
+            manager=getattr(contact, "manager", None),
+            source="gal",
         )
 
     def create_contact(self, request: CreateContactRequest) -> ActionResult:

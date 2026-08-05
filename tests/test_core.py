@@ -10,13 +10,13 @@ from types import SimpleNamespace
 import pytest
 from exchangelib import FileAttachment, Q
 from exchangelib.attachments import AttachmentId
-from exchangelib.errors import ErrorAccessDenied, ErrorItemNotFound, TransportError
+from exchangelib.errors import ErrorAccessDenied, ErrorInvalidIdMalformed, ErrorItemNotFound, ErrorNameResolutionNoResults, TransportError
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import ReadTimeout
 from exchangelib.version import EXCHANGE_2013, Version
 
 from exchange_mcp.config import Settings, get_settings
-from exchange_mcp.errors import APIError
+from exchange_mcp.errors import APIError, NotFoundError
 from exchange_mcp.ews.email import _validate_inline_images
 from exchange_mcp.exchange_client import EWSExchangeBackend, ExchangeClient
 from exchange_mcp.models import (
@@ -27,11 +27,13 @@ from exchange_mcp.models import (
     DeleteContactRequest,
     EmailAddress,
     FindFreeSlotsRequest,
+    GetContactRequest,
     InlineImage,
     ListEmailsRequest,
     ListEventsRequest,
     ListTasksRequest,
     MarkEmailRequest,
+    SearchContactsRequest,
     SearchEmailsRequest,
     SendEmailRequest,
     SendResult,
@@ -317,6 +319,7 @@ def test_delete_contact_moves_to_trash(backend):
     [
         (ErrorAccessDenied("Access is denied."), "permission_denied"),
         (ErrorItemNotFound("The specified object was not found in the store."), "not_found"),
+        (ErrorInvalidIdMalformed("Id is malformed."), "not_found"),
         (TransportError("connection timed out"), "timeout"),
         (TransportError("connection reset"), "exchange_unavailable"),
         (ReadTimeout("HTTPSConnectionPool(host='mail.example.com', port=443): Read timed out. (read timeout=30)"), "timeout"),
@@ -693,3 +696,122 @@ def test_task_tools_schema(settings):
     assert tools["delete_task"].inputSchema["required"] == ["id"]
     assert tools["list_tasks"].inputSchema.get("required", []) == []
 
+
+def _gal_entries():
+    """Fake ResolveNames resolution: mailbox + full Contact (id=None, prefixed emails)."""
+    mailbox = SimpleNamespace(name="Анна Тест", email_address="anna@corp.example")
+    contact = SimpleNamespace(
+        id=None,
+        display_name="Анна Тест",
+        file_as=None,
+        email_addresses=[
+            SimpleNamespace(email="sip:anna@corp.example"),
+            SimpleNamespace(email="smtp:anna@alias.example"),
+            SimpleNamespace(email="SMTP:anna@corp.example"),
+        ],
+        phone_numbers=[SimpleNamespace(label="BusinessPhone", phone_number=None)],
+        company_name="ООО «Тест»",
+        job_title="Инженер",
+        department="Отдел тестов",
+        given_name="Анна",
+        surname="Тест",
+        manager="Босс",
+        physical_addresses=[
+            SimpleNamespace(label="Business", street="ул. 1", city="Тюмень", state="TMN", zipcode="625000", country="Russia")
+        ],
+        notes=None,
+    )
+    return [(mailbox, contact)]
+
+
+def _patch_resolve_names(monkeypatch, resolved):
+    class FakeResolveNames:
+        def __init__(self, protocol):
+            pass
+
+        def call(self, **kwargs):
+            return iter(resolved)
+
+    monkeypatch.setattr("exchange_mcp.exchange_client.ResolveNames", FakeResolveNames)
+
+
+def test_search_contacts_gal_returns_full_contact_data(backend, monkeypatch):
+    _patch_resolve_names(monkeypatch, _gal_entries())
+    results = backend.search_contacts(SearchContactsRequest(query="anna", source="gal"))
+    assert len(results) == 1
+    hit = results[0]
+    assert hit.source == "gal"
+    assert hit.id == "anna@corp.example"
+    assert hit.display_name == "Анна Тест"
+    assert hit.company == "ООО «Тест»"
+    assert hit.job_title == "Инженер"
+    assert hit.department == "Отдел тестов"
+    assert hit.email_addresses == ["anna@corp.example", "anna@alias.example"]
+    assert hit.phone_numbers == []
+
+
+def test_search_contacts_gal_falls_back_to_mailbox(backend, monkeypatch):
+    _patch_resolve_names(monkeypatch, [(SimpleNamespace(name="Без контакта", email_address="m@corp.example"), None)])
+    results = backend.search_contacts(SearchContactsRequest(query="m", source="gal"))
+    assert len(results) == 1
+    assert results[0].id == "m@corp.example"
+    assert results[0].display_name == "Без контакта"
+    assert results[0].email_addresses == ["m@corp.example"]
+    assert results[0].company is None
+
+
+def test_get_contact_gal_by_email_id(backend, monkeypatch):
+    _patch_resolve_names(monkeypatch, _gal_entries())
+    contact = backend.get_contact(GetContactRequest(id="anna@corp.example"))
+    assert contact.source == "gal"
+    assert contact.first_name == "Анна"
+    assert contact.last_name == "Тест"
+    assert contact.company == "ООО «Тест»"
+    assert contact.job_title == "Инженер"
+    assert contact.department == "Отдел тестов"
+    assert contact.manager == "Босс"
+    assert contact.email_addresses[0].address == "anna@corp.example"
+    assert contact.addresses[0].city == "Тюмень"
+    assert contact.addresses[0].postal_code == "625000"
+
+
+def test_get_contact_gal_not_found(backend, monkeypatch):
+    _patch_resolve_names(monkeypatch, [])
+    with pytest.raises(NotFoundError):
+        backend.get_contact(GetContactRequest(id="ghost@corp.example"))
+
+
+def test_resolve_gal_treats_streamed_exceptions_as_no_match(backend, monkeypatch):
+    _patch_resolve_names(monkeypatch, [ErrorNameResolutionNoResults("No results were found.")])
+    assert backend.search_contacts(SearchContactsRequest(query="ghost", source="gal")) == []
+    with pytest.raises(NotFoundError):
+        backend.get_contact(GetContactRequest(id="ghost@corp.example"))
+
+
+def test_get_contact_personal_uses_item_fetch(backend):
+    item = SimpleNamespace(
+        id="AAMk-personal",
+        display_name="Личный",
+        file_as=None,
+        given_name="Имя",
+        surname="Фам",
+        email_addresses=[SimpleNamespace(label="EmailAddress1", email="me@home.example")],
+        phone_numbers=[],
+        physical_addresses=[],
+        company_name=None,
+        job_title=None,
+        department=None,
+        manager=None,
+        notes=None,
+        birthday=None,
+    )
+    backend._fetch_item = lambda _id, folder=None: item
+    contact = backend.get_contact(GetContactRequest(id="AAMk-personal"))
+    assert contact.source == "personal"
+    assert contact.id == "AAMk-personal"
+
+
+def test_fetch_item_maps_yielded_exception(backend):
+    backend._account.fetch = lambda ids, folder=None: iter([ErrorInvalidIdMalformed("Id is malformed.")])
+    with pytest.raises(NotFoundError):
+        backend._fetch_item("bad-id")
