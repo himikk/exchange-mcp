@@ -11,6 +11,8 @@ import pytest
 from exchangelib import FileAttachment, Q
 from exchangelib.attachments import AttachmentId
 from exchangelib.errors import ErrorAccessDenied, ErrorItemNotFound, TransportError
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ReadTimeout
 from exchangelib.version import EXCHANGE_2013, Version
 
 from exchange_mcp.config import Settings, get_settings
@@ -84,8 +86,13 @@ class FakeItem:
 class FakeQS:
     def __init__(self):
         self.filters = []
+        self.only_fields = None
 
     def order_by(self, *_):
+        return self
+
+    def only(self, *fields):
+        self.only_fields = fields
         return self
 
     def filter(self, *args, **kwargs):
@@ -222,6 +229,32 @@ def test_search_emails_passes_query_through(backend):
     assert folder.qs.filters[0][0] == ("from:boss@corp.com AND hasattachment:true",)
 
 
+def test_list_emails_restricts_fields(backend):
+    folder = FakeFolder()
+    backend._resolve_folder = lambda _=None: folder
+    backend.list_emails(ListEmailsRequest())
+    assert folder.qs.only_fields is not None
+    assert "text_body" in folder.qs.only_fields
+    assert "body" not in folder.qs.only_fields
+    assert "mime_content" not in folder.qs.only_fields
+
+
+def test_search_emails_restricts_fields(backend):
+    folder = FakeFolder()
+    backend._resolve_folder = lambda _=None: folder
+    backend.search_emails(SearchEmailsRequest(query="q", folder="inbox"))
+    assert folder.qs.only_fields is not None
+    assert "body" not in folder.qs.only_fields
+
+
+def test_list_tasks_restricts_fields(backend):
+    folder = FakeTasksFolder()
+    backend._account.tasks = folder
+    backend.list_tasks(ListTasksRequest())
+    assert folder.qs.only_fields is not None
+    assert "body" not in folder.qs.only_fields
+
+
 def test_search_emails_maps_errors(backend):
     class BoomFolder(FakeFolder):
         def filter(self, *args, **kwargs):
@@ -286,10 +319,32 @@ def test_delete_contact_moves_to_trash(backend):
         (ErrorItemNotFound("The specified object was not found in the store."), "not_found"),
         (TransportError("connection timed out"), "timeout"),
         (TransportError("connection reset"), "exchange_unavailable"),
+        (ReadTimeout("HTTPSConnectionPool(host='mail.example.com', port=443): Read timed out. (read timeout=30)"), "timeout"),
+        (RequestsConnectionError("Connection aborted."), "exchange_unavailable"),
     ],
 )
 def test_map_exception(backend, exc, code):
     assert backend._map_exception(exc, item_id="i1").code == code
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ReadTimeout("Read timed out. (read timeout=30)"),
+        RequestsConnectionError("Connection aborted."),
+        TransportError("connection timed out"),
+        TransportError("connection reset by peer"),
+    ],
+)
+def test_map_exception_invalidates_account_on_connection_failures(backend, exc):
+    assert backend._account is not None
+    backend._map_exception(exc)
+    assert backend._account is None
+
+
+def test_map_exception_keeps_account_on_logical_errors(backend):
+    backend._map_exception(ErrorAccessDenied("Access is denied."))
+    assert backend._account is not None
 
 
 def test_exchange_version_wiring(backend):
@@ -527,8 +582,13 @@ class FakeTask:
 class FakeTaskQS:
     def __init__(self):
         self.filters = []
+        self.only_fields = None
 
     def all(self):
+        return self
+
+    def only(self, *fields):
+        self.only_fields = fields
         return self
 
     def order_by(self, *_):
@@ -632,3 +692,4 @@ def test_task_tools_schema(settings):
     assert tools["complete_task"].inputSchema["required"] == ["id"]
     assert tools["delete_task"].inputSchema["required"] == ["id"]
     assert tools["list_tasks"].inputSchema.get("required", []) == []
+

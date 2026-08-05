@@ -291,8 +291,15 @@ def build_mcp_server(settings: Settings | None = None, client: ExchangeClient | 
 
 
 def main() -> None:
+    import threading
+
     settings = get_settings()
-    server = build_mcp_server(settings=settings)
+    backend = build_default_backend(settings)
+    client = ExchangeClient(settings=settings, backend=backend)
+    server = build_mcp_server(settings=settings, client=client)
+    # Build the EWS session in the background so the first tool call does not
+    # pay for auth + version negotiation (cold start caused first-call timeouts).
+    threading.Thread(target=backend.warm_up, name="ews-warm-up", daemon=True).start()
     transport = settings.mcp_transport
 
     if transport == "stdio":
@@ -301,6 +308,10 @@ def main() -> None:
 
     if transport == "sse":  # pragma: no cover
         server.run(transport="sse")
+        return
+
+    if transport == "streamable-http":  # pragma: no cover
+        server.run(transport="streamable-http")
         return
 
     raise RuntimeError(f"unsupported transport: {transport}")

@@ -27,12 +27,14 @@ class Settings(BaseSettings):
     )
     exchange_version: str | None = Field(default=None, alias="EXCHANGE_VERSION")
     exchange_timeout: int = Field(default=30, alias="EXCHANGE_TIMEOUT", ge=1, le=300)
-    exchange_max_retries: int = Field(default=3, alias="EXCHANGE_MAX_RETRIES", ge=0, le=10)
+    # Keep the total retry budget small: MCP clients typically give up after
+    # ~60s, so long server-side retry loops (timeout * retries) run for nobody.
+    exchange_max_retries: int = Field(default=1, alias="EXCHANGE_MAX_RETRIES", ge=0, le=10)
     exchange_timezone: str = Field(default="Europe/Moscow", alias="EXCHANGE_TIMEZONE")
     exchange_impersonate_as: str | None = Field(default=None, alias="EXCHANGE_IMPERSONATE_AS")
     attachment_max_size_mb: int = Field(default=10, alias="ATTACHMENT_MAX_SIZE_MB", ge=1, le=100)
 
-    mcp_transport: Literal["stdio", "sse"] = Field(default="stdio", alias="MCP_TRANSPORT")
+    mcp_transport: Literal["stdio", "sse", "streamable-http"] = Field(default="stdio", alias="MCP_TRANSPORT")
     mcp_sse_host: str = Field(default="127.0.0.1", alias="MCP_SSE_HOST")
     mcp_sse_port: int = Field(default=8080, alias="MCP_SSE_PORT", ge=1, le=65535)
 

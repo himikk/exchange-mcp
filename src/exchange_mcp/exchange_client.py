@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
+import threading
 import warnings
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, time, timedelta
@@ -46,6 +47,8 @@ from exchangelib.protocol import BaseProtocol, FailFast, FaultTolerance, NoVerif
 from exchangelib.services import ResolveNames
 from exchangelib import version as ews_version
 from requests.adapters import HTTPAdapter
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
 from urllib3.exceptions import InsecureRequestWarning
 
 from .auth import build_auth_context
@@ -117,6 +120,66 @@ logger = logging.getLogger(__name__)
 _TZ_FROM_MS_ID_ORIGINAL = None
 _GUID_TIMEZONE_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_EWS_ID_RE = re.compile(r"^[A-Za-z0-9+/=]{40,}$")
+
+# Restricted field sets for list queries. Without .only(), exchangelib requests
+# ALL item fields (full body, MIME content, headers, attachments), which forces
+# a heavy GetItem round-trip per page and regularly blows the EWS read timeout
+# on slow servers. These sets cover exactly what the summary models need.
+_EMAIL_SUMMARY_FIELDS = (
+    "subject",
+    "author",
+    "sender",
+    "to_recipients",
+    "datetime_received",
+    "datetime_sent",
+    "datetime_created",
+    "is_read",
+    "has_attachments",
+    "importance",
+    "categories",
+    "text_body",
+)
+_EVENT_FIELDS = (
+    "subject",
+    "start",
+    "end",
+    "location",
+    "organizer",
+    "required_attendees",
+    "optional_attendees",
+    "is_all_day",
+    "is_recurring",
+    "my_response_type",
+    "meeting_workspace_url",
+    "net_show_url",
+    "text_body",
+    "reminder_minutes_before_start",
+    "categories",
+    "recurrence",
+    "importance",
+)
+_TASK_SUMMARY_FIELDS = (
+    "subject",
+    "status",
+    "percent_complete",
+    "due_date",
+    "start_date",
+    "is_complete",
+    "has_attachments",
+    "importance",
+    "categories",
+    "reminder_is_set",
+)
+_CONTACT_SUMMARY_FIELDS = (
+    "display_name",
+    "file_as",
+    "email_addresses",
+    "phone_numbers",
+    "company_name",
+    "job_title",
+    "department",
 )
 
 
@@ -290,12 +353,26 @@ class EWSExchangeBackend:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._account: Account | None = None
+        self._account_lock = threading.Lock()
 
     @property
     def account(self) -> Account:
         if self._account is None:
-            self._account = self._build_account()
+            with self._account_lock:
+                if self._account is None:
+                    self._account = self._build_account()
         return self._account
+
+    def warm_up(self) -> None:
+        """Build the Account eagerly so the first tool call does not pay for
+        auth, server version negotiation and folder resolution."""
+        try:
+            account = self.account
+            # Touch the distinguished folder hierarchy to prime exchangelib's cache
+            account.inbox.refresh()
+            logger.info("exchange session warmed up for %s", account.primary_smtp_address)
+        except Exception as exc:  # noqa: BLE001 — warm-up is best-effort
+            logger.warning("exchange warm-up failed (first call will retry): %s", exc)
 
     def _build_account(self) -> Account:
         auth = build_auth_context(self.settings)
@@ -428,10 +505,16 @@ class EWSExchangeBackend:
                         raise NotFoundError(value)
                     current = next_folder
                 return current
-        # Try to find by ID first
-        for folder in account.root.walk():
-            if getattr(folder, "id", None) == value:
-                return folder
+        # If the value looks like an EWS folder ID, bind to it directly with a
+        # single GetFolder call instead of walking the entire folder hierarchy.
+        if _EWS_ID_RE.match(value):
+            candidate = Folder(root=account.root, id=value)
+            try:
+                candidate.refresh()
+            except Exception:  # noqa: BLE001 — not an ID (or gone); fall back to path traversal
+                pass
+            else:
+                return candidate
         # Try to traverse from root
         current = account.root
         for part in parts:
@@ -668,11 +751,35 @@ class EWSExchangeBackend:
             if "access is denied" in lowered or "permission" in lowered:
                 return PermissionDeniedError()
             return APIError("exchange_error", message)
+        # Raw requests-level network failures: drop the cached account so the
+        # next call rebuilds the EWS session instead of reusing a dead socket.
+        if isinstance(exc, RequestsTimeout):
+            self._invalidate_account()
+            return TimeoutAPIError(self.settings.exchange_timeout)
+        if isinstance(exc, RequestsConnectionError):
+            self._invalidate_account()
+            return ExchangeUnavailableError(message)
         if isinstance(exc, (TransportError, TimeoutError)):
-            if "timed out" in message.lower():
+            lowered = message.lower()
+            if "timed out" in lowered or "timeout" in lowered:
+                self._invalidate_account()
                 return TimeoutAPIError(self.settings.exchange_timeout)
+            if "connection" in lowered or "reset" in lowered or "aborted" in lowered:
+                self._invalidate_account()
             return ExchangeUnavailableError(message)
         return ExchangeUnavailableError(message)
+
+    def _invalidate_account(self) -> None:
+        if self._account is None:
+            return
+        logger.warning("dropping cached Exchange session after a connection failure; it will be rebuilt on next call")
+        try:
+            close = getattr(getattr(self._account, "protocol", None), "close", None)
+            if callable(close):
+                close()
+        except Exception:  # noqa: BLE001 — best-effort cleanup of a broken session
+            pass
+        self._account = None
 
     def ping(self) -> PingResult:
         started = datetime.now(UTC)
@@ -698,7 +805,7 @@ class EWSExchangeBackend:
 
     def list_emails(self, request: ListEmailsRequest) -> list[EmailSummary]:
         folder = self._resolve_folder(request.folder)
-        qs = folder.all().order_by("-datetime_received")
+        qs = folder.all().only(*_EMAIL_SUMMARY_FIELDS).order_by("-datetime_received")
         if request.from_address:
             # EWS restrictions cannot filter on the sender's email address, and AQS
             # query strings cannot be combined with restrictions, so the whole
@@ -751,7 +858,7 @@ class EWSExchangeBackend:
         # properties (subject, body, sender, recipients) using the content index.
         # AQS keywords like from:, subject:, hasattachment: are passed through as-is.
         try:
-            qs = folder.filter(request.query).order_by("-datetime_received")
+            qs = folder.filter(request.query).only(*_EMAIL_SUMMARY_FIELDS).order_by("-datetime_received")
             items = list(qs[: request.limit])
         except Exception as exc:  # noqa: BLE001
             raise self._map_exception(exc) from exc
@@ -945,10 +1052,10 @@ class EWSExchangeBackend:
         start = self._to_ews_datetime(request.start)
         end = self._to_ews_datetime(request.end)
         if request.include_recurring:
-            qs = folder.view(start=start, end=end)
+            qs = folder.view(start=start, end=end).only(*_EVENT_FIELDS)
         else:
             # A restriction-based query returns recurring masters unexpanded
-            qs = folder.filter(start__lt=end, end__gt=start)
+            qs = folder.filter(start__lt=end, end__gt=start).only(*_EVENT_FIELDS)
         try:
             items = list(qs)
         except Exception as exc:  # noqa: BLE001
@@ -1169,7 +1276,7 @@ class EWSExchangeBackend:
         results: list[ContactSummary] = []
         if request.source in {"personal", "all"}:
             try:
-                qs = self.account.contacts.filter(display_name__icontains=request.query)[: request.limit]
+                qs = self.account.contacts.filter(display_name__icontains=request.query).only(*_CONTACT_SUMMARY_FIELDS)[: request.limit]
                 results.extend(self._contact_summary_from_contact(contact, "personal") for contact in qs)
             except Exception as exc:  # noqa: BLE001
                 raise self._map_exception(exc) from exc
@@ -1353,7 +1460,7 @@ class EWSExchangeBackend:
         return None
 
     def list_tasks(self, request: ListTasksRequest) -> list[TaskSummary]:
-        qs = self.account.tasks.all().order_by("-due_date")
+        qs = self.account.tasks.all().only(*_TASK_SUMMARY_FIELDS).order_by("-due_date")
         filters: dict[str, Any] = {}
         if request.status:
             filters["status"] = self._TASK_STATUS_REVERSE[request.status]
